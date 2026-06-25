@@ -7,11 +7,15 @@ import {
 } from "../modules/vm-webrtc/src/mcp_client/extensions";
 import { log } from "./logger";
 import {
+  deleteMcpClientSecret,
+  getMcpClientSecret,
   getMcpClientId,
   getMcpRefreshToken,
   getMcpTokenEndpoint,
+  saveMcpAuthMode,
   saveMcpBearerToken,
   saveMcpClientId,
+  saveMcpClientSecret,
   saveMcpRefreshToken,
   saveMcpTokenEndpoint,
 } from "./secure-storage";
@@ -31,18 +35,28 @@ export type McpOAuthFlowResult =
   | { type: "success"; accessToken: string; refreshToken?: string }
   | { type: "needs_manual_callback"; pendingState: McpOAuthPendingState };
 
+// Static client credentials — only the client ID and optional secret are needed.
+// OAuth endpoints are auto-discovered from the MCP server, just like DCR mode.
+export interface StaticOAuthCredentials {
+  clientId: string;
+  clientSecret?: string;
+}
+
 export async function performMcpOAuthFlow(
   extensionId: string,
   resourceMetadataUrl: string,
   connectorName?: string,
   extensionInfo?: { serverUrl: string; normalizedName: string },
+  staticCredentials?: StaticOAuthCredentials,
 ): Promise<McpOAuthFlowResult> {
+  const mode = staticCredentials ? "static" : "dcr";
   log.info(
     "[mcp_oauth] Starting OAuth flow",
     {},
-    { extension_id: extensionId, connector_name: connectorName },
+    { extension_id: extensionId, connector_name: connectorName, mode },
   );
 
+  // Both DCR and static share OAuth endpoint discovery from the MCP server.
   const resourceMetadata = await fetchResourceMetadata(resourceMetadataUrl, connectorName);
   const authServerUrl = resourceMetadata.authorizationServers[0];
   const oauthMeta = await fetchOAuthServerMetadata(authServerUrl, connectorName);
@@ -52,21 +66,44 @@ export async function performMcpOAuthFlow(
     path: "mcp-oauth-callback",
   });
 
-  let clientId = await getMcpClientId(extensionId);
-  if (!clientId) {
-    if (!oauthMeta.registrationEndpoint) {
-      throw new Error(
-        "Server requires OAuth but has no registration_endpoint and no cached client_id",
-      );
-    }
-    const reg = await registerOAuthClient(
-      oauthMeta.registrationEndpoint,
-      redirectUri,
-      connectorName,
-    );
-    clientId = reg.clientId;
+  let clientId: string;
+  let clientSecret: string | undefined;
+
+  if (staticCredentials) {
+    // Static mode: use provided credentials, skip dynamic client registration.
+    clientId = staticCredentials.clientId;
+    clientSecret = staticCredentials.clientSecret;
     await saveMcpClientId(extensionId, clientId);
+    if (clientSecret) {
+      await saveMcpClientSecret(extensionId, clientSecret);
+    } else {
+      await deleteMcpClientSecret(extensionId);
+    }
+    await saveMcpAuthMode(extensionId, "static");
+  } else {
+    // DCR mode: register a new public client or reuse a cached one.
+    const cachedId = await getMcpClientId(extensionId);
+    if (cachedId) {
+      clientId = cachedId;
+    } else {
+      if (!oauthMeta.registrationEndpoint) {
+        throw new Error(
+          "Server requires OAuth but has no registration_endpoint and no cached client_id",
+        );
+      }
+      const reg = await registerOAuthClient(
+        oauthMeta.registrationEndpoint,
+        redirectUri,
+        connectorName,
+      );
+      clientId = reg.clientId;
+      await saveMcpClientId(extensionId, clientId);
+    }
+    await deleteMcpClientSecret(extensionId);
+    await saveMcpAuthMode(extensionId, "dcr");
   }
+
+  await saveMcpTokenEndpoint(extensionId, oauthMeta.tokenEndpoint);
 
   const discovery = {
     authorizationEndpoint: oauthMeta.authorizationEndpoint,
@@ -96,9 +133,9 @@ export async function performMcpOAuthFlow(
   };
 
   log.info(
-    "[mcp_oauth] Step 5: opening browser for authorization",
+    "[mcp_oauth] Opening browser for authorization",
     {},
-    { connector_name: connectorName },
+    { connector_name: connectorName, mode },
   );
 
   const result = await request.promptAsync(discovery);
@@ -108,7 +145,6 @@ export async function performMcpOAuthFlow(
     {},
     {
       result_type: result.type,
-      params: result.type === "success" ? result.params : undefined,
       error: (result as any).error ?? undefined,
       connector_name: connectorName,
     },
@@ -116,7 +152,7 @@ export async function performMcpOAuthFlow(
 
   if (result.type === "success" && result.params.code) {
     log.info(
-      "[mcp_oauth] Step 6: exchanging code for token",
+      "[mcp_oauth] Exchanging code for token",
       {},
       { connector_name: connectorName },
     );
@@ -128,6 +164,7 @@ export async function performMcpOAuthFlow(
       oauthMeta.tokenEndpoint,
       extensionId,
       connectorName,
+      clientSecret,
     );
     return { type: "success", ...tokens };
   }
@@ -142,7 +179,6 @@ export async function performMcpOAuthFlow(
     throw new Error(`OAuth error: ${detail}`);
   }
 
-  // Browser was dismissed or redirect wasn't intercepted — surface manual paste UI
   log.info(
     "[mcp_oauth] Browser closed without redirect, returning manual callback state",
     {},
@@ -171,6 +207,8 @@ export async function completeMcpOAuthFromCallbackUrl(
     { extension_id: pendingState.extensionId },
   );
 
+  const clientSecret = await getMcpClientSecret(pendingState.extensionId);
+
   return exchangeAndStore(
     code,
     pendingState.clientId,
@@ -178,6 +216,8 @@ export async function completeMcpOAuthFromCallbackUrl(
     pendingState.codeVerifier,
     pendingState.tokenEndpoint,
     pendingState.extensionId,
+    undefined,
+    clientSecret ?? undefined,
   );
 }
 
@@ -189,14 +229,21 @@ async function exchangeAndStore(
   tokenEndpoint: string,
   extensionId: string,
   connectorName?: string,
+  clientSecret?: string,
 ): Promise<{ accessToken: string; refreshToken?: string }> {
+  const exchangeConfig: any = {
+    code,
+    clientId,
+    redirectUri,
+  };
+  if (clientSecret) {
+    exchangeConfig.clientSecret = clientSecret;
+  }
+  if (codeVerifier) {
+    exchangeConfig.extraParams = { code_verifier: codeVerifier };
+  }
   const tokenResponse = await AuthSession.exchangeCodeAsync(
-    {
-      code,
-      clientId,
-      redirectUri,
-      extraParams: { code_verifier: codeVerifier },
-    },
+    exchangeConfig,
     { tokenEndpoint },
   );
 
@@ -209,7 +256,11 @@ async function exchangeAndStore(
   log.info(
     "[mcp_oauth] OAuth flow complete",
     {},
-    { connector_name: connectorName, has_refresh_token: !!tokenResponse.refreshToken },
+    {
+      connector_name: connectorName,
+      has_refresh_token: !!tokenResponse.refreshToken,
+      used_client_secret: !!clientSecret,
+    },
   );
 
   return {
@@ -222,25 +273,35 @@ export async function refreshMcpAccessToken(
   extensionId: string,
   connectorName?: string,
 ): Promise<string | null> {
-  const [refreshToken, tokenEndpoint] = await Promise.all([
+  const [refreshToken, tokenEndpoint, clientId, clientSecret] = await Promise.all([
     getMcpRefreshToken(extensionId),
     getMcpTokenEndpoint(extensionId),
+    getMcpClientId(extensionId),
+    getMcpClientSecret(extensionId),
   ]);
 
-  if (!refreshToken || !tokenEndpoint) return null;
-
-  const clientId = await getMcpClientId(extensionId);
-  if (!clientId) return null;
+  if (!refreshToken || !tokenEndpoint || !clientId) return null;
 
   log.info(
     "[mcp_oauth] Refreshing access token",
     {},
-    { extension_id: extensionId, connector_name: connectorName },
+    {
+      extension_id: extensionId,
+      connector_name: connectorName,
+      has_client_secret: !!clientSecret,
+    },
   );
 
   try {
+    const refreshConfig: any = {
+      clientId,
+      refreshToken,
+    };
+    if (clientSecret) {
+      refreshConfig.clientSecret = clientSecret;
+    }
     const tokenResponse = await AuthSession.refreshAsync(
-      { clientId, refreshToken },
+      refreshConfig,
       { tokenEndpoint },
     );
 
