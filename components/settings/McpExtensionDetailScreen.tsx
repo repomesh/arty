@@ -27,6 +27,8 @@ import {
   getMcpBearerToken,
   type McpExtensionRecord,
 } from "../../lib/secure-storage";
+import { refreshMcpAccessTokenWithDetails } from "../../lib/mcp-oauth";
+import { log } from "../../lib/logger";
 import { CONNECTOR_SETTINGS_CHANGED_EVENT } from "../../modules/vm-webrtc/src/ToolkitManager";
 import { McpConnectorConfig } from "./McpConnectorConfig";
 
@@ -52,6 +54,7 @@ export const McpExtensionDetailScreen: React.FC<McpExtensionDetailScreenProps> =
   const [toolsError, setToolsError] = useState<string | null>(null);
   const [configureVisible, setConfigureVisible] = useState(false);
   const [urlCopied, setUrlCopied] = useState(false);
+  const [refreshingAccessToken, setRefreshingAccessToken] = useState(false);
 
   useEffect(() => {
     setCurrentExtension(extension);
@@ -157,6 +160,98 @@ export const McpExtensionDetailScreen: React.FC<McpExtensionDetailScreenProps> =
         [
           { text: "Cancel", style: "cancel" },
           { text: "Reset Auth", style: "destructive", onPress: doReset },
+        ]
+      );
+    }
+  };
+
+  const handleRefreshAccessToken = async () => {
+    if (refreshingAccessToken) return;
+
+    setRefreshingAccessToken(true);
+    try {
+      log.info(
+        "[mcp_detail] Manual access token refresh requested",
+        {},
+        {
+          extension_id: currentExtension.id,
+          extension_name: currentExtension.name,
+          server_url: currentExtension.serverUrl,
+        }
+      );
+
+      const result = await refreshMcpAccessTokenWithDetails(
+        currentExtension.id,
+        currentExtension.name
+      );
+      if (result.type === "failure") {
+        log.warn(
+          "[mcp_detail] Manual access token refresh failed",
+          {},
+          {
+            extension_id: currentExtension.id,
+            extension_name: currentExtension.name,
+            user_message: result.userMessage,
+            oauth_error_code: result.oauthErrorCode,
+          }
+        );
+        Alert.alert("Refresh Failed", result.userMessage, [{ text: "OK" }]);
+        return;
+      }
+
+      DeviceEventEmitter.emit(CONNECTOR_SETTINGS_CHANGED_EVENT);
+      fetchTools();
+      Alert.alert("Access Token Refreshed", "A new access token was saved.", [{ text: "OK" }]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.error(
+        "[mcp_detail] Manual access token refresh threw unexpected error",
+        {},
+        {
+          extension_id: currentExtension.id,
+          extension_name: currentExtension.name,
+          error_name: err instanceof Error ? err.name : undefined,
+          error_message: message,
+          error_stack: err instanceof Error ? err.stack : undefined,
+        }
+      );
+      Alert.alert(
+        "Refresh Failed",
+        `Could not refresh the access token: ${message}`,
+        [{ text: "OK" }]
+      );
+    } finally {
+      setRefreshingAccessToken(false);
+    }
+  };
+
+  const handleResetAccessToken = () => {
+    const doReset = async () => {
+      await deleteMcpBearerToken(currentExtension.id);
+      DeviceEventEmitter.emit(CONNECTOR_SETTINGS_CHANGED_EVENT);
+    };
+
+    if (Platform.OS === "ios") {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          title: `Reset access token for "${currentExtension.name}"?`,
+          message:
+            "The access token will be dropped. The app will use the refresh token on the next MCP call.",
+          options: ["Cancel", "Reset Access Token"],
+          destructiveButtonIndex: 1,
+          cancelButtonIndex: 0,
+        },
+        (buttonIndex) => {
+          if (buttonIndex === 1) doReset();
+        }
+      );
+    } else {
+      Alert.alert(
+        "Reset Access Token",
+        `Drop the access token for "${currentExtension.name}"? The app will use the refresh token on the next MCP call.`,
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Reset Access Token", style: "destructive", onPress: doReset },
         ]
       );
     }
@@ -270,23 +365,58 @@ export const McpExtensionDetailScreen: React.FC<McpExtensionDetailScreenProps> =
         </ScrollView>
 
         <View style={[styles.footer, { paddingBottom: insets.bottom + 16 }]}>
+          <View style={styles.footerPrimaryActions}>
+            <Pressable
+              style={({ pressed }) => [
+                styles.configureButton,
+                pressed && styles.configureButtonPressed,
+              ]}
+              onPress={() => setConfigureVisible(true)}
+            >
+              <Text style={styles.configureButtonText}>Configure</Text>
+            </Pressable>
+            <Pressable
+              style={({ pressed }) => [
+                styles.resetAuthButton,
+                pressed && styles.resetAuthButtonPressed,
+              ]}
+              onPress={handleResetAuth}
+            >
+              <Text style={styles.resetAuthButtonText}>Reset Auth</Text>
+            </Pressable>
+            <Pressable
+              style={({ pressed }) => [
+                styles.removeButton,
+                pressed && styles.removeButtonPressed,
+              ]}
+              onPress={handleRemove}
+            >
+              <Text style={styles.removeButtonText}>Remove</Text>
+            </Pressable>
+          </View>
           <Pressable
-            style={({ pressed }) => [styles.configureButton, pressed && styles.configureButtonPressed]}
-            onPress={() => setConfigureVisible(true)}
+            style={({ pressed }) => [
+              styles.resetAccessTokenButton,
+              pressed && styles.resetAccessTokenButtonPressed,
+            ]}
+            onPress={handleResetAccessToken}
           >
-            <Text style={styles.configureButtonText}>Configure</Text>
+            <Text style={styles.resetAccessTokenButtonText}>Reset Access Token</Text>
           </Pressable>
           <Pressable
-            style={({ pressed }) => [styles.resetAuthButton, pressed && styles.resetAuthButtonPressed]}
-            onPress={handleResetAuth}
+            disabled={refreshingAccessToken}
+            style={({ pressed }) => [
+              styles.refreshAccessTokenButton,
+              pressed && styles.refreshAccessTokenButtonPressed,
+              refreshingAccessToken && styles.refreshAccessTokenButtonDisabled,
+            ]}
+            onPress={handleRefreshAccessToken}
           >
-            <Text style={styles.resetAuthButtonText}>Reset Auth</Text>
-          </Pressable>
-          <Pressable
-            style={({ pressed }) => [styles.removeButton, pressed && styles.removeButtonPressed]}
-            onPress={handleRemove}
-          >
-            <Text style={styles.removeButtonText}>Remove</Text>
+            {refreshingAccessToken ? (
+              <ActivityIndicator size="small" color="#FFFFFF" />
+            ) : (
+              <Text style={styles.refreshAccessTokenButtonText}>Refresh Access Token</Text>
+            )}
           </Pressable>
         </View>
       </SafeAreaView>
@@ -497,13 +627,16 @@ const styles = StyleSheet.create({
     lineHeight: 17,
   },
   footer: {
-    flexDirection: "row",
     gap: 12,
     paddingHorizontal: 20,
     paddingTop: 16,
     borderTopWidth: 1,
     borderTopColor: "#E5E5EA",
     backgroundColor: "#F5F5F7",
+  },
+  footerPrimaryActions: {
+    flexDirection: "row",
+    gap: 12,
   },
   configureButton: {
     flex: 1,
@@ -553,5 +686,38 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "600",
     color: "#FF3B30",
+  },
+  resetAccessTokenButton: {
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#0A84FF",
+  },
+  resetAccessTokenButtonPressed: {
+    backgroundColor: "#F0F6FF",
+  },
+  resetAccessTokenButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#0A84FF",
+  },
+  refreshAccessTokenButton: {
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: "center",
+    backgroundColor: "#0A84FF",
+  },
+  refreshAccessTokenButtonPressed: {
+    backgroundColor: "#006EDB",
+  },
+  refreshAccessTokenButtonDisabled: {
+    opacity: 0.65,
+  },
+  refreshAccessTokenButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#FFFFFF",
   },
 });

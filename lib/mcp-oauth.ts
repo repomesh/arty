@@ -1,4 +1,5 @@
 import * as AuthSession from "expo-auth-session";
+import * as Crypto from "expo-crypto";
 
 import {
   fetchOAuthServerMetadata,
@@ -11,12 +12,14 @@ import {
   getMcpClientSecret,
   getMcpClientId,
   getMcpRefreshToken,
+  getMcpResource,
   getMcpTokenEndpoint,
   saveMcpAuthMode,
   saveMcpBearerToken,
   saveMcpClientId,
   saveMcpClientSecret,
   saveMcpRefreshToken,
+  saveMcpResource,
   saveMcpTokenEndpoint,
 } from "./secure-storage";
 
@@ -104,6 +107,7 @@ export async function performMcpOAuthFlow(
   }
 
   await saveMcpTokenEndpoint(extensionId, oauthMeta.tokenEndpoint);
+  await saveMcpResource(extensionId, resourceMetadata.resource);
 
   const discovery = {
     authorizationEndpoint: oauthMeta.authorizationEndpoint,
@@ -165,6 +169,7 @@ export async function performMcpOAuthFlow(
       extensionId,
       connectorName,
       clientSecret,
+      resourceMetadata.resource,
     );
     return { type: "success", ...tokens };
   }
@@ -207,7 +212,10 @@ export async function completeMcpOAuthFromCallbackUrl(
     { extension_id: pendingState.extensionId },
   );
 
-  const clientSecret = await getMcpClientSecret(pendingState.extensionId);
+  const [clientSecret, resource] = await Promise.all([
+    getMcpClientSecret(pendingState.extensionId),
+    getMcpResource(pendingState.extensionId),
+  ]);
 
   return exchangeAndStore(
     code,
@@ -218,6 +226,7 @@ export async function completeMcpOAuthFromCallbackUrl(
     pendingState.extensionId,
     undefined,
     clientSecret ?? undefined,
+    resource ?? undefined,
   );
 }
 
@@ -230,6 +239,7 @@ async function exchangeAndStore(
   extensionId: string,
   connectorName?: string,
   clientSecret?: string,
+  resource?: string,
 ): Promise<{ accessToken: string; refreshToken?: string }> {
   const exchangeConfig: any = {
     code,
@@ -239,8 +249,15 @@ async function exchangeAndStore(
   if (clientSecret) {
     exchangeConfig.clientSecret = clientSecret;
   }
+  const extraParams: Record<string, string> = {};
   if (codeVerifier) {
-    exchangeConfig.extraParams = { code_verifier: codeVerifier };
+    extraParams.code_verifier = codeVerifier;
+  }
+  if (resource) {
+    extraParams.resource = resource;
+  }
+  if (Object.keys(extraParams).length > 0) {
+    exchangeConfig.extraParams = extraParams;
   }
   const tokenResponse = await AuthSession.exchangeCodeAsync(
     exchangeConfig,
@@ -273,14 +290,88 @@ export async function refreshMcpAccessToken(
   extensionId: string,
   connectorName?: string,
 ): Promise<string | null> {
-  const [refreshToken, tokenEndpoint, clientId, clientSecret] = await Promise.all([
+  const result = await refreshMcpAccessTokenWithDetails(extensionId, connectorName);
+  return result.type === "success" ? result.accessToken : null;
+}
+
+export type McpAccessTokenRefreshResult =
+  | { type: "success"; accessToken: string }
+  | { type: "failure"; userMessage: string; oauthErrorCode?: string };
+
+const sha256Prefix = async (value: string | null | undefined): Promise<string> => {
+  if (!value) return "(none)";
+  const hash = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value);
+  return hash.slice(0, 8);
+};
+
+const getOAuthRefreshErrorCode = (err: unknown): string | undefined =>
+  (err as any)?.code ??
+  (err as any)?.error ??
+  (typeof (err as any)?.message === "string"
+    ? (err as any).message.match(/\b(invalid_\w+|unauthorized_client|access_denied)\b/)?.[0]
+    : undefined) ??
+  undefined;
+
+const buildMissingRefreshPrerequisiteMessage = (missingFields: string[]): string => {
+  if (missingFields.length === 1) {
+    const missingField = missingFields[0];
+    if (missingField === "refresh_token") {
+      return "Missing saved refresh token. Re-authenticate this connector, then try again.";
+    }
+    if (missingField === "token_endpoint") {
+      return "Missing saved token endpoint. Re-authenticate this connector, then try again.";
+    }
+    if (missingField === "client_id") {
+      return "Missing saved client ID. Re-authenticate this connector, then try again.";
+    }
+  }
+
+  return `Missing saved OAuth refresh credentials (${missingFields.join(", ")}). Re-authenticate this connector, then try again.`;
+};
+
+export async function refreshMcpAccessTokenWithDetails(
+  extensionId: string,
+  connectorName?: string,
+): Promise<McpAccessTokenRefreshResult> {
+  const [refreshToken, tokenEndpoint, clientId, clientSecret, resource] = await Promise.all([
     getMcpRefreshToken(extensionId),
     getMcpTokenEndpoint(extensionId),
     getMcpClientId(extensionId),
     getMcpClientSecret(extensionId),
+    getMcpResource(extensionId),
   ]);
 
-  if (!refreshToken || !tokenEndpoint || !clientId) return null;
+  const missingFields = [
+    !refreshToken ? "refresh_token" : null,
+    !tokenEndpoint ? "token_endpoint" : null,
+    !clientId ? "client_id" : null,
+  ].filter((field): field is string => !!field);
+
+  if (!refreshToken || !tokenEndpoint || !clientId) {
+    log.warn(
+      "[mcp_oauth] Cannot refresh access token because stored OAuth refresh prerequisites are missing",
+      {},
+      {
+        extension_id: extensionId,
+        connector_name: connectorName,
+        missing_fields: missingFields,
+        has_refresh_token: !!refreshToken,
+        has_token_endpoint: !!tokenEndpoint,
+        has_client_id: !!clientId,
+        has_client_secret: !!clientSecret,
+      },
+    );
+    return {
+      type: "failure",
+      userMessage: buildMissingRefreshPrerequisiteMessage(missingFields),
+      oauthErrorCode: undefined,
+    };
+  }
+
+  const [clientIdHash, clientSecretHash] = await Promise.all([
+    sha256Prefix(clientId),
+    sha256Prefix(clientSecret),
+  ]);
 
   log.info(
     "[mcp_oauth] Refreshing access token",
@@ -288,7 +379,14 @@ export async function refreshMcpAccessToken(
     {
       extension_id: extensionId,
       connector_name: connectorName,
+      has_client_id: !!clientId,
+      client_id: clientId,
+      client_id_hash: clientIdHash,
       has_client_secret: !!clientSecret,
+      client_secret_length: clientSecret?.length ?? 0,
+      client_secret_hash: clientSecretHash,
+      token_endpoint: tokenEndpoint,
+      resource: resource ?? null,
     },
   );
 
@@ -297,13 +395,41 @@ export async function refreshMcpAccessToken(
       clientId,
       refreshToken,
     };
+    // Use client_secret_post (credentials in body) not client_secret_basic (Authorization header).
+    // expo-auth-session switches to Basic auth when clientSecret is set directly, but
+    // brain3-dev only accepts client_secret_post.
+    const extraParams: Record<string, string> = {};
     if (clientSecret) {
-      refreshConfig.clientSecret = clientSecret;
+      extraParams.client_secret = clientSecret;
+    }
+    if (resource) {
+      extraParams.resource = resource;
+    }
+    if (Object.keys(extraParams).length > 0) {
+      refreshConfig.extraParams = extraParams;
     }
     const tokenResponse = await AuthSession.refreshAsync(
       refreshConfig,
       { tokenEndpoint },
     );
+
+    if (!tokenResponse.accessToken) {
+      log.error(
+        "[mcp_oauth] Token refresh response did not include an access token",
+        {},
+        {
+          extension_id: extensionId,
+          connector_name: connectorName,
+          token_endpoint: tokenEndpoint,
+          response_keys: Object.keys(tokenResponse),
+        },
+      );
+      return {
+        type: "failure",
+        userMessage:
+          "The OAuth provider refresh response did not include an access token. Re-authenticate this connector, then try again.",
+      };
+    }
 
     await saveMcpBearerToken(extensionId, tokenResponse.accessToken);
     if (tokenResponse.refreshToken) {
@@ -311,13 +437,35 @@ export async function refreshMcpAccessToken(
     }
 
     log.info("[mcp_oauth] Token refresh succeeded", {}, { connector_name: connectorName });
-    return tokenResponse.accessToken;
+    return { type: "success", accessToken: tokenResponse.accessToken };
   } catch (err) {
+    const oauthCode = getOAuthRefreshErrorCode(err);
+    const errorMessage = err instanceof Error ? err.message : String(err);
     log.warn(
       "[mcp_oauth] Token refresh failed",
       {},
-      { connector_name: connectorName, error: err instanceof Error ? err.message : String(err) },
+      {
+        extension_id: extensionId,
+        connector_name: connectorName,
+        error_name: err instanceof Error ? err.name : undefined,
+        error_message: errorMessage,
+        error_stack: err instanceof Error ? err.stack : undefined,
+        oauth_error_code: oauthCode,
+        token_endpoint: tokenEndpoint,
+        has_refresh_token: !!refreshToken,
+        has_client_id: !!clientId,
+        client_id: clientId,
+        client_id_hash: clientIdHash,
+        has_client_secret: !!clientSecret,
+        client_secret_hash: clientSecretHash,
+      },
     );
-    return null;
+    return {
+      type: "failure",
+      userMessage: oauthCode
+        ? `The OAuth provider rejected the refresh request (${oauthCode}). Re-authenticate this connector, then try again.`
+        : `Could not refresh the access token: ${errorMessage}`,
+      oauthErrorCode: oauthCode,
+    };
   }
 }
